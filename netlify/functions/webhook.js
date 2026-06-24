@@ -164,14 +164,19 @@ exports.handler = async (event) => {
   const body = JSON.parse(event.body);
   const events = body.events || [];
 
-  // LINEには先に200を返す方が安全だが、reply tokenは1回限りなので
-  // ここでは同期処理（Haikuは速いのでタイムアウト圏内に収まりやすい）
   for (const ev of events) {
     if (ev.type !== "message" || ev.message.type !== "text") continue;
+
+    // ★ LINEの再送(リトライ)対策：再送イベントは処理せずスキップ
+    if (ev.deliveryContext && ev.deliveryContext.isRedelivery === true) {
+      console.log("Skip redelivered event");
+      continue;
+    }
 
     const userMessage = ev.message.text;
     const userId = ev.source?.userId || "(不明)";
     let replyText;
+    let pendingMail = null;
 
     try {
       const token = await getAccessToken();
@@ -185,14 +190,12 @@ exports.handler = async (event) => {
         replyText =
           "申し訳ございません。その内容はお調べして担当者よりご連絡いたします。お急ぎの場合はお電話ください。";
 
-        // Claudeが推定した部署名から、部署マスタの送信先を引く
         const dept = deptList.find((d) => d.name === result.dept) || deptList[0] || null;
         const deptName = dept ? dept.name : "(未振り分け)";
         const deptEmail = dept ? dept.email : "";
 
-        // 未回答ログに記録 → 該当部署へメール通知
         await appendLog(token, userId, userMessage, deptName, deptEmail);
-        await notifyByMail(deptEmail, deptName, userId, userMessage);
+        pendingMail = { deptEmail, deptName, userId, userMessage };
       }
     } catch (e) {
       console.error("ERROR:", e);
@@ -200,6 +203,15 @@ exports.handler = async (event) => {
     }
 
     await replyToLine(ev.replyToken, replyText);
+
+    if (pendingMail) {
+      await notifyByMail(
+        pendingMail.deptEmail,
+        pendingMail.deptName,
+        pendingMail.userId,
+        pendingMail.userMessage
+      );
+    }
   }
 
   return { statusCode: 200, body: "OK" };
